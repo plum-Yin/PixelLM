@@ -245,7 +245,7 @@ class PixelLMForCausalLM(LlavaLlamaForCausalLM):
         # import pdb;pdb.set_trace()
         # 
         kwargs.update({
-            "image_feature_scale_num": 2, 
+            "image_feature_scale_num": 2,
             "pad_train_clip_images": True,
             "resize_vision_tower": True,
             "resize_vision_tower_size": 448,
@@ -258,8 +258,9 @@ class PixelLMForCausalLM(LlavaLlamaForCausalLM):
         config.pad_train_clip_images = kwargs.get("pad_train_clip_images", False)
         config.vision_tower_for_mask = kwargs.get("vision_tower_for_mask", False)
         config.separate_mm_projector = kwargs.get("separate_mm_projector", False)
-        config.mm_projector_hidden_dim = 2
-        config.mm_projector_out_dim = 1
+        # Use a single-hidden layer width to match pretrained projector shapes by default
+        config.mm_projector_hidden_dim = kwargs.get("mm_projector_hidden_dim", 1)
+        config.mm_projector_out_dim = kwargs.get("mm_projector_out_dim", 1)
         self.image_feature_scale_num = kwargs.get("image_feature_scale_num", 1)
         config.image_feature_scale_num = kwargs.get("image_feature_scale_num", 1)
         if not hasattr(config, "train_mask_decoder"):

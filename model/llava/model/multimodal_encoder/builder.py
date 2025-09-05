@@ -1,4 +1,5 @@
 from .clip_encoder import CLIPVisionTower
+from model.eva_dino_qformer_encoder import EvaDinoQFormerVisionTower
 
 
 def build_vision_tower(vision_tower_cfg, **kwargs):
@@ -7,11 +8,6 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
         "mm_vision_tower",
         getattr(vision_tower_cfg, "vision_tower", None),
     )
-    if (
-        vision_tower.startswith("openai")
-        or vision_tower.startswith("laion")
-        or "clip" in vision_tower
-    ):
-        return CLIPVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
-
-    raise ValueError(f"Unknown vision tower: {vision_tower}")
+    # 强制使用自定义的 EVA+DINO+Q-Former 视觉塔，以满足新融合策略
+    # 保留回退开关：若环境需原生 CLIP，可按需改回原逻辑
+    return EvaDinoQFormerVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)

@@ -33,9 +33,7 @@ import base64
 def parse_args(args):
     parser = argparse.ArgumentParser(description="PixelLM Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
-    parser.add_argument(
-        "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
-    )
+    parser.add_argument("--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",
@@ -118,6 +116,11 @@ def parse_args(args):
     parser.add_argument("--use_expand_question_list", action="store_true", default=False)
     parser.add_argument("--separate_mm_projector", action="store_true", default=False)
     parser.add_argument("--image_feature_scale_num", default=1, type=int)
+    # newly added
+    parser.add_argument("--eva_clip_path", default="eva02_large_patch14_clip_336.merged2b", type=str)
+    parser.add_argument("--dino_path", default="vit_large_patch14_dinov2.lvd142m", type=str)
+    parser.add_argument("--qformer_path", default="Salesforce/blip2-qformer", type=str)
+    parser.add_argument("--num_query", default=32, type=int)
 
     
     parser.add_argument(
@@ -200,7 +203,11 @@ def main(args):
         "separate_mm_projector": args.separate_mm_projector,
         "masks_process_with_clip": args.masks_process_with_clip,
         "image_feature_scale_num": args.image_feature_scale_num,
-
+        # newly added
+        "eva_clip_path": args.eva_clip_path,
+        "dino_path": args.dino_path,
+        "qformer_path": args.qformer_path,
+        "num_query": args.num_query,
     }
     torch_dtype = torch.float32
     if args.precision == "bf16":

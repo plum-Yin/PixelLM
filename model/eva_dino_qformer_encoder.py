@@ -1,216 +1,222 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import timm
 from types import SimpleNamespace
-from transformers import CLIPVisionModel, Blip2QFormerModel
+from transformers import CLIPVisionModel, Blip2QFormerModel, CLIPImageProcessor
 
-# ============== 辅助：规范化与反规范化（近似） ==============
-# 假设 images 已按 CLIP 规范化到 [-1,1]（很多 LLaVA/EVA-CLIP 管线如此）
-# 将其近似还原到 [0,1]，再做 ImageNet 规范化供 DINO/ViT 使用
+
 class OptionalReNorm(nn.Module):
+    """
+    将 CLIP 范围 [-1,1] 的图像近似还原到 [0,1]，再做 ImageNet 规范化，供 DINO 使用。
+    """
     def __init__(self, enable=True):
         super().__init__()
         self.enable = enable
-        # ImageNet 规范化
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1)
-        std  = torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         self.register_buffer('mean', mean)
         self.register_buffer('std', std)
 
     def forward(self, x_clip_norm):
         if not self.enable:
             return x_clip_norm
-        # 近似把 [-1,1] 还原为 [0,1]
         x01 = (x_clip_norm + 1.0) * 0.5
-        # 再做 ImageNet 规范化
         return (x01 - self.mean) / self.std
 
-# ============== DINOv2 后端适配器 ==============
-class DINOBackbone(nn.Module):
+
+class DINOv2TimmWrapper(nn.Module):
     """
-    统一接口：
-      forward(images) -> SimpleNamespace(last_hidden_state=[B, N, D])
-    优先级：
-      1) timm 的 DINOv2
-      2) torch.hub facebookresearch/dinov2
-      3) timm 的通用 ViT 兜底
-      4) 恒等伪模型兜底（返回零特征）
+    通过 timm 加载 DINOv2，并返回 [B, N, D] 的 patch tokens
     """
-    def __init__(self, model_name='vit_large_patch14_dinov2.lvd142m',
-                 use_timm=True, use_torchhub=True, imagenet_norm=True):
+    def __init__(self, model_name="vit_large_patch14_dinov2.lvd142m"):
         super().__init__()
-        self.imagenet_norm = OptionalReNorm(enable=imagenet_norm)
-        self.backend = None
-        self.embed_dim = None
-
-        # 1) timm DINOv2
-        if use_timm:
-            try:
-                import timm
-                self.backend = timm.create_model(model_name, pretrained=True)
-                # timm ViT 都有 embed_dim / num_patches 等属性
-                self.embed_dim = getattr(self.backend, 'embed_dim', None)
-                self._backend_type = 'timm_dino'
-            except Exception:
-                self.backend = None
-
-        # 2) torch.hub 官方 dinov2
-        if self.backend is None and use_torchhub:
-            try:
-                # 可选：'dinov2_vitb14', 'dinov2_vitl14', 'dinov2_vitg14'
-                self.backend = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14')
-                # 常见 embed_dim：vitl14 为 1024
-                self.embed_dim = getattr(self.backend, 'embed_dim', 1024)
-                self._backend_type = 'hub_dino'
-            except Exception:
-                self.backend = None
-
-        # 3) timm ViT 兜底
-        if self.backend is None:
-            try:
-                import timm
-                self.backend = timm.create_model('vit_large_patch14_224', pretrained=True)
-                self.embed_dim = getattr(self.backend, 'embed_dim', None)
-                self._backend_type = 'timm_vit'
-            except Exception:
-                self.backend = None
-
-        # 4) 最终兜底：恒等伪模型（返回零向量）
-        if self.backend is None or self.embed_dim is None:
-            self._backend_type = 'dummy'
-            self.embed_dim = 1024  # 给一个合理的默认 D
-            # 注册一个“空参数”，以便模型能 .to(device)
-            self.register_parameter('_dummy', nn.Parameter(torch.zeros(1)))
-
-    @torch.inference_mode()
-    def _forward_backend(self, x):
-        t = self._backend_type
-        if t in ('timm_dino', 'timm_vit'):
-            # timm ViT 家族
-            feats = self.backend.forward_features(x)  # 兼容新旧 timm：可能是 tensor 或 dict
-            if isinstance(feats, dict):
-                # 新版 timm 通常在 'x' 给出 [B, N+1, D]（含 CLS）
-                tokens = feats.get('x', None)
-                if tokens is None:
-                    # 旧版可能直接返回 [B, D] 的 pooled，尝试从 'attn' 或其他键恢复困难
-                    # 退化为使用全局 token 复制，避免崩溃
-                    pooled = feats.get('pooled', None)
-                    if pooled is not None:
-                        tokens = pooled.unsqueeze(1)  # [B,1,D]
-                    else:
-                        raise RuntimeError('Unexpected timm forward_features dict structure')
-            else:
-                # 某些版本直接返回 [B, N+1, D] 的 tokens
-                tokens = feats
-            # 去掉 CLS
-            if tokens.dim() == 3 and tokens.size(1) >= 2:
-                tokens = tokens[:, 1:, :]
-            return tokens  # [B, N, D]
-
-        elif t == 'hub_dino':
-            # 官方 dinov2：不同 commit 的字段名可能不同，这里尽量兼容
-            if hasattr(self.backend, 'forward_features'):
-                feats = self.backend.forward_features(x)
-                if isinstance(feats, dict):
-                    # 常见键：'x_norm_patchtokens'（[B,N,D]）或 'x_norm_clstoken'
-                    tokens = feats.get('x_norm_patchtokens', None)
-                    if tokens is None:
-                        # 尝试 'x' 然后去 CLS
-                        tokens = feats.get('x', None)
-                        if tokens is not None and tokens.dim() == 3 and tokens.size(1) >= 2:
-                            tokens = tokens[:, 1:, :]
-                    if tokens is None:
-                        raise RuntimeError('Unexpected hub dinov2 dict structure')
-                else:
-                    # 偶见直接返回 [B,N+1,D]
-                    tokens = feats
-                    if tokens.dim() == 3 and tokens.size(1) >= 2:
-                        tokens = tokens[:, 1:, :]
-                return tokens  # [B, N, D]
-            else:
-                # 极老版本：直接前向得到 [B, num_classes]，无法拿 tokens，只能报错
-                raise RuntimeError('hub dinov2 has no forward_features')
-
-        elif t == 'dummy':
-            B, _, H, W = x.shape
-            N = (H // 14) * (W // 14)  # 假定 patch14，做个形状兜底
-            return x.new_zeros(B, N, self.embed_dim)
-
-        else:
-            raise RuntimeError(f'Unknown backend type: {t}')
+        self.model = timm.create_model(model_name, pretrained=True)
+        self.embed_dim = self.model.embed_dim  # 例如 vit_large_patch14_dinov2 = 1024
 
     def forward(self, images):
-        # 可选从 CLIP 规范化近似还原并转到 ImageNet 规范化
-        x = self.imagenet_norm(images)  # 如果你已单独做了 ImageNet 规范化，可把 imagenet_norm=False
-        tokens = self._forward_backend(x)  # [B, N, D]
-        return SimpleNamespace(last_hidden_state=tokens, hidden_states=None)
-        
+        # timm 的 ViT forward_features 返回字典，x 为 [B, N+1, D] (含 CLS)
+        feats = self.model.forward_features(images)
+        if isinstance(feats, dict) and "x" in feats:
+            tokens = feats["x"]  # [B, N+1, D]
+        else:
+            tokens = feats
+        # 去掉 CLS token
+        patch_tokens = tokens[:, 1:, :]  # [B, N, D]
+        return SimpleNamespace(last_hidden_state=patch_tokens)
+
 
 class EvaDinoQFormerVisionTower(nn.Module):
-    def __init__(self, args):
+    """
+    自定义 VisionTower：EVA-CLIP ⊕ DINOv2，经 Cross-Attn 融合为密集 token（I_v），
+    同时支持可选 Q-Former 短序列压缩。为对接 LLaVA/PixelLM 管线：
+      - forward(images) 返回 (image_features=I_v, pre_image_features=[I_clip])
+      - 提供 image_processor / hidden_size / dtype / device / dummy_feature 等属性
+      - 支持 resize_vision_tower 以 448 等尺寸运行 EVA-CLIP
+    构造签名与 CLIPVisionTower 对齐：__init__(vision_tower, args, delay_load=False)
+    """
+
+    def __init__(self, vision_tower, args, delay_load=False):
         super().__init__()
+        self.is_loaded = False
+        self.vision_tower_name = vision_tower
+        self.args = args
+
+        # 训练配置
+        self.pad_vit = getattr(args, "pad_train_clip_images", False)
+        self.resize_vision_tower = getattr(args, "resize_vision_tower", False)
+        self.resize_vision_tower_size = getattr(args, "resize_vision_tower_size", 224)
+
+        # 预处理器
+        try:
+            self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
+        except Exception:
+            self.image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
+
+        # 模块占位
+        self.eva_clip = None
+        self.dino = None
+        self.dino_proj = None
+        self.cross_attention = None
+        self.qformer = None
+        self.q_proj_in = None
+        self.q_proj_out = None
+        self.learnable_query = None
+        self._clip_dim = None
+
+        if not delay_load:
+            self.load_model()
+
+    def load_model(self):
         # 1) EVA-CLIP
-        self.eva_clip = CLIPVisionModel.from_pretrained(args.eva_clip_path)
-        clip_dim = self.eva_clip.config.hidden_size  # 例如 768/1024
+        # 若用户提供 eva_clip_path 优先使用，否则用 vision_tower_name
+        eva_name = getattr(self.args, 'eva_clip_path', None) or self.vision_tower_name
+        self.eva_clip = CLIPVisionModel.from_pretrained(eva_name)
+        clip_dim = self.eva_clip.config.hidden_size
+        self._clip_dim = clip_dim
 
-        # 2) DINOv2 替代（优先 timm）
-        #    model_name 可选：'vit_base_patch14_dinov2' 族或带权重后缀的 timm 名称
-        dino_model_name = getattr(args, 'dino_model_name', 'vit_large_patch14_dinov2.lvd142m')
-        self.dino = DINOBackbone(model_name=dino_model_name,
-                                 use_timm=getattr(args, 'use_timm', True),
-                                 use_torchhub=getattr(args, 'use_torchhub', True),
-                                 imagenet_norm=getattr(args, 'dino_use_imagenet_norm', True))
+        # 支持可选位置编码 resize 到更大输入
+        if self.resize_vision_tower:
+            vt = self.eva_clip
+            origin_p_num = int(vt.vision_model.embeddings.num_patches ** 0.5)
+            vision_tower_embed_dim = vt.vision_model.embeddings.embed_dim
+            vt.vision_model.embeddings.image_size = self.resize_vision_tower_size
+            vt.vision_model.embeddings.num_patches = (
+                self.resize_vision_tower_size // vt.vision_model.embeddings.patch_size
+            ) ** 2
+            vt.vision_model.embeddings.num_positions = vt.vision_model.embeddings.num_patches + 1
+            vt.vision_model.embeddings.register_buffer(
+                "position_ids", torch.arange(vt.vision_model.embeddings.num_positions).expand((1, -1))
+            )
+            new_p_num = int(vt.vision_model.embeddings.num_patches ** 0.5)
+
+            origin_position_embedding_weight = vt.vision_model.embeddings.position_embedding.weight
+            origin_position_embedding_weight_cls = origin_position_embedding_weight[-1:]
+            origin_position_embedding_weight = (
+                origin_position_embedding_weight[:-1]
+                .permute(1, 0)
+                .view(1, vision_tower_embed_dim, origin_p_num, origin_p_num)
+            )
+            new_position_embedding_weight = F.interpolate(
+                origin_position_embedding_weight,
+                (new_p_num, new_p_num),
+                mode="bilinear",
+                align_corners=False,
+            )[0]
+            new_position_embedding_weight = new_position_embedding_weight.flatten(-2).permute(1, 0)
+            new_position_embedding_weight = torch.cat(
+                (new_position_embedding_weight, origin_position_embedding_weight_cls), dim=0
+            )
+            vt.vision_model.embeddings.position_embedding = nn.Embedding(
+                vt.vision_model.embeddings.num_positions, vision_tower_embed_dim
+            )
+            vt.vision_model.embeddings.position_embedding.weight = torch.nn.Parameter(
+                new_position_embedding_weight
+            ).to(origin_position_embedding_weight)
+            vt.vision_model.embeddings.position_ids = (
+                vt.vision_model.embeddings.position_ids.to(origin_position_embedding_weight.device)
+            )
+
+        # 2) DINOv2（默认 timm）
+        dino_model_name = getattr(self.args, "dino_model_name", "vit_large_patch14_dinov2.lvd142m")
+        self.dino = DINOv2TimmWrapper(dino_model_name)
         dino_dim = self.dino.embed_dim
+        self.imagenet_norm = OptionalReNorm(enable=True)
 
-        # 维度对齐：将 DINO 的 D 投到 EVA-CLIP 的 D
+        # 3) 维度对齐 + Cross Attention
         self.dino_proj = nn.Linear(dino_dim, clip_dim, bias=False)
-
-        # 3) Cross Attention (EVA 作为 Q，DINO 作为 K/V)
+        num_heads = getattr(self.args, "cross_attn_heads", 8)
         self.cross_attention = nn.MultiheadAttention(
-            embed_dim=clip_dim, num_heads=8, batch_first=True
+            embed_dim=clip_dim, num_heads=num_heads, batch_first=True
         )
 
-        # 4) Q-Former
-        self.qformer = Blip2QFormerModel.from_pretrained(args.qformer_path)
-        assert self.qformer.config.hidden_size == clip_dim, \
-            f"Q-Former hidden_size({self.qformer.config.hidden_size})需与 clip_dim({clip_dim})一致"
+        # 4) Q-Former（可选）
+        qformer_path = getattr(self.args, "qformer_path", None)
+        if qformer_path:
+            self.qformer = Blip2QFormerModel.from_pretrained(qformer_path)
+            qformer_dim = self.qformer.config.hidden_size
+            if qformer_dim != clip_dim:
+                self.q_proj_in = nn.Linear(clip_dim, qformer_dim, bias=False)
+                self.q_proj_out = nn.Linear(qformer_dim, clip_dim, bias=False)
+            else:
+                self.q_proj_in = nn.Identity()
+                self.q_proj_out = nn.Identity()
+            num_query = getattr(self.args, "num_query", 32)
+            self.learnable_query = nn.Parameter(torch.randn(num_query, clip_dim))
 
-        # 5) Learnable Queries（用于 Q-Former 的 query_embeds）
-        self.learnable_query = nn.Parameter(torch.randn(args.num_query, clip_dim))
+        self.is_loaded = True
+        # 默认冻结视觉模型，后续由上层按需控制 requires_grad
+        self.requires_grad_(False)
 
-        # 可选：LayerNorm 稳定跨模态融合
-        self.pre_ln_clip = nn.LayerNorm(clip_dim)
-        self.pre_ln_dino = nn.LayerNorm(clip_dim)
+    @torch.no_grad()
+    def forward(self, images, attention_mask=None):
+        assert self.is_loaded, "Vision tower not loaded; call load_model() first."
+        # EVA-CLIP：去 CLS
+        I_clip = self.eva_clip(images, output_hidden_states=False).last_hidden_state[:, 1:, :]
+        # DINO：ImageNet 归一化
+        I_dino_in = self.imagenet_norm(images)
+        I_dino = self.dino_proj(self.dino(I_dino_in).last_hidden_state)
 
-    def forward(self, images, text_embeds=None):
-        # images：建议已按 CLIP 规范化到 [-1,1]；DINO 支路内部会近似转换到 ImageNet 规范化
-        # 1) 视觉特征
-        clip_out = self.eva_clip(images, output_hidden_states=True)
-        I_clip = clip_out.last_hidden_state            # [B, N1, D]
-        dino_out = self.dino(images)
-        I_dino_raw = dino_out.last_hidden_state        # [B, N2, D_dino]
-        I_dino = self.dino_proj(I_dino_raw)            # [B, N2, D_clip]
+        # Cross-Attention 融合
+        I_v, _ = self.cross_attention(I_clip, I_dino, I_dino)
+        image_features = I_v.to(images.dtype)
+        pre_image_features = [I_clip.to(images.dtype)]
+        return image_features, pre_image_features
 
-        # 2) 可选 LayerNorm
-        I_clip = self.pre_ln_clip(I_clip)
-        I_dino = self.pre_ln_dino(I_dino)
+    @torch.no_grad()
+    def forward_qformer(self, images, text_embeds=None):
+        if self.qformer is None:
+            raise RuntimeError("Q-Former not initialized; provide qformer_path in args.")
+        I_clip = self.eva_clip(images, output_hidden_states=False).last_hidden_state[:, 1:, :]
+        I_dino_in = self.imagenet_norm(images)
+        I_dino = self.dino_proj(self.dino(I_dino_in).last_hidden_state)
+        I_v, _ = self.cross_attention(I_clip, I_dino, I_dino)
 
-        # 3) Cross Attention：EVA 为 Query，DINO 为 K/V
-        I_v, _ = self.cross_attention(I_clip, I_dino, I_dino)  # [B, N1, D]
-
-        # 4) 组织 Q-Former 的 query_embeds
         B = images.size(0)
-        learnable_q = self.learnable_query.unsqueeze(0).expand(B, -1, -1)  # [B, Q, D]
-        if text_embeds is not None:
-            q_input = torch.cat([learnable_q, text_embeds], dim=1)         # [B, Q+Tq, D]
-        else:
-            q_input = learnable_q
-
-        # 5) Q-Former 融合
-        qf_out = self.qformer(
-            query_embeds=q_input,
-            encoder_hidden_states=I_v
-        ).last_hidden_state  # [B, Q(+Tq), D]
-
-        # 6) 仅取 learnable_query 对应部分作为最终视觉特征（与原逻辑一致）
-        img_embeds = qf_out[:, :self.learnable_query.size(0), :]  # [B, Q, D]
+        learnable_q = self.learnable_query.unsqueeze(0).expand(B, -1, -1)
+        q_input = torch.cat([learnable_q, text_embeds], dim=1) if text_embeds is not None else learnable_q
+        q_input = self.q_proj_in(q_input)
+        qf_out = self.qformer(query_embeds=q_input, encoder_hidden_states=I_v).last_hidden_state
+        img_embeds = qf_out[:, :self.learnable_query.size(0), :]
+        img_embeds = self.q_proj_out(img_embeds).to(images.dtype)
         return img_embeds
+
+    @property
+    def dtype(self):
+        return self.eva_clip.dtype if self.eva_clip is not None else torch.float16
+
+    @property
+    def device(self):
+        return self.eva_clip.device if self.eva_clip is not None else torch.device("cpu")
+
+    @property
+    def config(self):
+        return self.eva_clip.config if self.eva_clip is not None else SimpleNamespace(hidden_size=self._clip_dim or 1024)
+
+    @property
+    def hidden_size(self):
+        return self.config.hidden_size
+
+    @property
+    def dummy_feature(self):
+        return torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)

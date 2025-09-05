@@ -99,7 +99,7 @@ class LlavaMetaForCausalLM(ABC):
     def encode_images(self, images, clip_resize_list, return_project=False):
         vision_tower = self.get_model().get_vision_tower()
         vit_attention_mask_for_llm = None
-        if isinstance(vision_tower.vision_tower, _CLIPVisionModel):
+        if hasattr(vision_tower, 'vision_tower') and isinstance(vision_tower.vision_tower, _CLIPVisionModel):
             vit_attention_mask = torch.zeros_like(images[:, 0, :, :])
             for i, size in enumerate(clip_resize_list):
                 vit_attention_mask[i, :size[0], :size[1]] = 1
