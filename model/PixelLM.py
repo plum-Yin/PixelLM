@@ -15,6 +15,9 @@ from .segment_anything.modeling import MaskDecoder, PromptEncoder, TwoWayTransfo
 from utils.matcher import match_pred
 from typing import Any, Dict, List, Tuple
 
+# clip + dino + qformer
+from model.eva_dino_qformer_encoder import EvaDinoQFormerVisionTower
+
 def dice_loss(
     inputs: torch.Tensor,
     targets: torch.Tensor,
@@ -449,17 +452,27 @@ class PixelLMForCausalLM(LlavaLlamaForCausalLM):
         for i in range(len(seg_token_offset) - 1):
             start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
             batch_pred_embeddings = pred_embeddings[start_i:end_i]
-            batch_seg_token_counts.append(seg_token_counts[offset[i]:offset[i+1]] // seg_token_num*feat_scale_num)
-            assert len(batch_pred_embeddings) % seg_token_num == 0
-            batch_pred_embeddings = batch_pred_embeddings.view(len(batch_pred_embeddings) // (seg_token_num*feat_scale_num), feat_scale_num, seg_token_num, batch_pred_embeddings.shape[-1]) #N, scale_num, seg_num, dim
+            # questions per image (do not scale by feat_scale_num)
+            batch_seg_token_counts.append(
+                seg_token_counts[offset[i]:offset[i + 1]] // seg_token_num
+            )
+            # group by seg tokens, then broadcast across scales
+            assert (
+                len(batch_pred_embeddings) % seg_token_num == 0
+            ), f"Invalid seg token count: {len(batch_pred_embeddings)} not divisible by seg_token_num={seg_token_num}"
+            n = len(batch_pred_embeddings) // seg_token_num
+            dim = batch_pred_embeddings.shape[-1]
+            batch_pred_embeddings = batch_pred_embeddings.view(n, seg_token_num, dim)  # [N, seg_num, D]
             if seg_token_num > 1:
-                fused_batch_pred_embeddings = batch_pred_embeddings[:, :, 0] * 0 #N, scale_num, dim
-                for i in range(seg_token_num):
-                    fused_batch_pred_embeddings = fused_batch_pred_embeddings + self.multiseg_scalar[i] * batch_pred_embeddings[:, :, i]
-                batch_pred_embeddings = fused_batch_pred_embeddings
+                fused = batch_pred_embeddings[:, 0] * 0
+                for j in range(seg_token_num):
+                    fused = fused + self.multiseg_scalar[j] * batch_pred_embeddings[:, j]
+                batch_pred_embeddings = fused  # [N, D]
             else:
-                batch_pred_embeddings = batch_pred_embeddings[:, :, 0]
-            
+                batch_pred_embeddings = batch_pred_embeddings[:, 0]  # [N, D]
+            # broadcast to multi-scale: [N, Lev, D]
+            batch_pred_embeddings = batch_pred_embeddings.unsqueeze(1).expand(-1, feat_scale_num, -1)
+
             pred_embeddings_.append(batch_pred_embeddings)
        
         pred_embeddings = pred_embeddings_  #number of image[seg token num in each image, ]
@@ -692,10 +705,6 @@ class PixelLMForCausalLM(LlavaLlamaForCausalLM):
                 last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
                 pred_embeddings = last_hidden_state[seg_token_mask]
 
-                if len(pred_embeddings) % (seg_token_num*feat_scale_num) != 0:
-                    seg_token_mask = (seg_token_mask*0).bool()
-                    pred_embeddings = last_hidden_state[seg_token_mask]
-
                 seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
                 seg_token_offset = seg_token_counts.cumsum(-1)
                 seg_token_offset = torch.cat(
@@ -704,22 +713,27 @@ class PixelLMForCausalLM(LlavaLlamaForCausalLM):
                 seg_token_offset = seg_token_offset[[0, len(seg_token_offset)-1]]
                 pred_embeddings_ = []
                 
-                
                 for i in range(len(seg_token_offset) - 1):
                     start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
                     batch_pred_embeddings = pred_embeddings[start_i:end_i]
-                    # if seg_token_num*feat_scale_num > 1:
-                    assert len(batch_pred_embeddings) % (seg_token_num*feat_scale_num) == 0
-                    batch_pred_embeddings = batch_pred_embeddings.view(len(batch_pred_embeddings) // (seg_token_num*feat_scale_num), feat_scale_num, seg_token_num, batch_pred_embeddings.shape[-1]) #N, scale_num, seg_num, dim
+                    # group by seg tokens, then broadcast across scales
+                    assert (
+                        len(batch_pred_embeddings) % seg_token_num == 0
+                    ), f"Invalid seg token count: {len(batch_pred_embeddings)} not divisible by seg_token_num={seg_token_num}"
+                    n = len(batch_pred_embeddings) // seg_token_num
+                    dim = batch_pred_embeddings.shape[-1]
+                    batch_pred_embeddings = batch_pred_embeddings.view(n, seg_token_num, dim)  # [N, seg_num, D]
                     if seg_token_num > 1:
-                        fused_batch_pred_embeddings = batch_pred_embeddings[:, :, 0] * 0 #N, scale_num, dim
-                        for i in range(seg_token_num):
-                            fused_batch_pred_embeddings = fused_batch_pred_embeddings + self.multiseg_scalar[i] * batch_pred_embeddings[:, :, i]
-                        batch_pred_embeddings = fused_batch_pred_embeddings
+                        fused = batch_pred_embeddings[:, 0] * 0
+                        for j in range(seg_token_num):
+                            fused = fused + self.multiseg_scalar[j] * batch_pred_embeddings[:, j]
+                        batch_pred_embeddings = fused  # [N, D]
                     else:
-                        batch_pred_embeddings = batch_pred_embeddings[:, :, 0]
+                        batch_pred_embeddings = batch_pred_embeddings[:, 0]  # [N, D]
+                    # broadcast to multi-scale: [N, Lev, D]
+                    batch_pred_embeddings = batch_pred_embeddings.unsqueeze(1).expand(-1, feat_scale_num, -1)
                     pred_embeddings_.append(batch_pred_embeddings)
-                batch_seg_token_counts.append(len(batch_pred_embeddings))
+                batch_seg_token_counts.append(n)
                 pred_embeddings = pred_embeddings_  #number of image[seg token num in each image, ]
                 all_pred_embeddings.extend(pred_embeddings)
             

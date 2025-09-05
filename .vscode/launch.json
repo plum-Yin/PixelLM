@@ -1,0 +1,100 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug: DeepSpeed (1 GPU)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "/data/zyin418/.conda_envs/pixellm/bin/deepspeed",
+      "args": [
+        "--num_gpus=1",
+        // 如果你有 DeepSpeed 配置文件，取消下一行注释并替换路径
+        // "--deepspeed_config=/data/zyin418/mllm/LISA/ds_config.json",
+        "train_ds.py",
+        // ====== 你的训练参数从这里开始（按需修改/添加）======
+        // "--train_file", "/path/to/train.jsonl",
+        // "--output_dir", "/path/to/output_ckpt",
+        // "--per_device_train_batch_size", "1",
+        // "--learning_rate", "1e-5",
+        // "--num_train_epochs", "1"
+      ],
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29500",
+        "NCCL_DEBUG": "INFO",
+        "HF_HOME": "/data/zyin418/.cache/huggingface",
+        "HTTP_PROXY": "http://squid.auckland.ac.nz:3128",
+        "HTTPS_PROXY": "http://squid.auckland.ac.nz:3128",
+        "LD_LIBRARY_PATH": "${env:CONDA_PREFIX}/lib:/usr/local/cuda/lib64:${env:LD_LIBRARY_PATH}"
+      },
+      "python": "/data/zyin418/.conda_envs/pixellm/bin/python",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true
+    },
+
+    // {
+    //   "name": "Debug: torchrun (NCCL, 2 GPUs example)",
+    //   "type": "python",
+    //   "request": "launch",
+    //   "module": "torch.distributed.run",
+    //   "args": [
+    //     "--nproc_per_node=2",
+    //     "--master_port=29501",
+    //     "train_ds.py",
+    //     // ====== 你的训练参数从这里开始（按需修改/添加）======
+    //     "--train_file", "/path/to/train.jsonl",
+    //     "--output_dir", "/path/to/output_ckpt",
+    //     "--per_device_train_batch_size", "1",
+    //     "--learning_rate", "1e-5",
+    //     "--num_train_epochs", "1"
+    //   ],
+    //   "env": {
+    //     "CUDA_VISIBLE_DEVICES": "0,1",
+    //     "MASTER_ADDR": "127.0.0.1",
+    //     "NCCL_DEBUG": "INFO",
+    //     "HF_HOME": "/data/zyin418/.cache/huggingface",
+    //     "HTTP_PROXY": "http://squid.auckland.ac.nz:3128",
+    //     "HTTPS_PROXY": "http://squid.auckland.ac.nz:3128",
+    //     "LD_LIBRARY_PATH": "${env:CONDA_PREFIX}/lib:/usr/local/cuda/lib64:${env:LD_LIBRARY_PATH}"
+    //   },
+    //   "python": "/data/zyin418/.conda_envs/pixellm/bin/python",
+    //   "cwd": "${workspaceFolder}",
+    //   "console": "integratedTerminal",
+    //   "justMyCode": false,
+    //   "subProcess": true
+    // },
+
+    // {
+    //   "name": "Debug: 单进程（不启用分布式）",
+    //   "type": "python",
+    //   "request": "launch",
+    //   "program": "${workspaceFolder}/train_ds.py",
+    //   "args": [
+    //     // ====== 你的训练参数从这里开始（按需修改/添加）======
+    //     "--train_file", "/path/to/train.jsonl",
+    //     "--output_dir", "/path/to/output_ckpt",
+    //     "--per_device_train_batch_size", "1",
+    //     "--learning_rate", "1e-5",
+    //     "--num_train_epochs", "1",
+    //     // 如果你的脚本支持，建议加上这些开关避免 deepspeed 初始化
+    //     // "--no_deepspeed",
+    //     // "--dist_init_required", "false"
+    //   ],
+    //   "env": {
+    //     "CUDA_VISIBLE_DEVICES": "0",
+    //     "HF_HOME": "/data/zyin418/.cache/huggingface",
+    //     "HTTP_PROXY": "http://squid.auckland.ac.nz:3128",
+    //     "HTTPS_PROXY": "http://squid.auckland.ac.nz:3128",
+    //     "LD_LIBRARY_PATH": "${env:CONDA_PREFIX}/lib:/usr/local/cuda/lib64:${env:LD_LIBRARY_PATH}"
+    //   },
+    //   "python": "/data/zyin418/.conda_envs/pixellm/bin/python",
+    //   "cwd": "${workspaceFolder}",
+    //   "console": "integratedTerminal",
+    //   "justMyCode": false,
+    //   "subProcess": false
+    // }
+  ]
+}
