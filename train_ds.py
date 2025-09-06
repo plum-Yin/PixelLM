@@ -99,6 +99,8 @@ def parse_args(args):
     parser.add_argument("--dino_path", default="facebook/dinov2-large", type=str)
     parser.add_argument("--qformer_path", default="Salesforce/blip2-qformer", type=str)
     parser.add_argument("--num_query", default=32, type=int)
+    parser.add_argument("--print_text_every", default=0, type=int, help="Print one LLaVA text output every N steps (0=disable)")
+    parser.add_argument("--peek_max_new_tokens", default=64, type=int, help="Max new tokens for preview generation")
     parser.add_argument("--conv_type",default="llava_llama_2",type=str,choices=["llava_v1", "llava_llama_2"],)
     return parser.parse_args(args)
 
@@ -497,6 +499,7 @@ def main(args):
             scheduler,
             writer,
             train_iter,
+            tokenizer,
             args,
         )
 
@@ -538,6 +541,7 @@ def train(
     scheduler,
     writer,
     train_iter,
+    tokenizer,
     args,
 ):
     """Main training loop."""
@@ -605,6 +609,62 @@ def train(
             # print("____loss____:", loss, "_____losses.val___", losses.val)
             model.backward(loss)
             model.step()
+
+            # Fine-grained micro-step progress (helps to see liveness during long steps)
+            micro_dt = time.time() - micro_t0
+            if args.local_rank == 0:
+                print(
+                    f"[micro] global {global_step+1}/{args.steps_per_epoch}"
+                    f" accum {i+1}/{args.grad_accumulation_steps}"
+                    f" time {micro_dt:.2f}s loss {loss.item():.4f}",
+                    flush=True,
+                )
+
+            # Live LLaVA text preview (lightweight, single sample) every N steps
+            if (
+                args.print_text_every and args.print_text_every > 0
+                and (global_step + 1) % args.print_text_every == 0
+                and i == args.grad_accumulation_steps - 1
+                and args.local_rank == 0
+            ):
+                try:
+                    with torch.no_grad():
+                        model.eval()
+                        # pick first image/conversation in this micro-batch
+                        images_clip = input_dict["images_clip"][:1]
+                        clip_resize_list = [input_dict["clip_resize_list"][0]]
+                        offset = input_dict["offset"]
+                        start_i = int(offset[0].item())
+                        # safeguard: if offset has >=2 entries
+                        pick_idx = start_i
+                        input_ids = input_dict["input_ids"][pick_idx]
+                        outputs = model.base_model.generate(
+                            images=images_clip,
+                            input_ids=input_ids[None],
+                            max_new_tokens=int(args.peek_max_new_tokens),
+                            num_beams=1,
+                            output_hidden_states=False,
+                            return_dict_in_generate=True,
+                            clip_resize_list=clip_resize_list,
+                        )
+                        seq = outputs.sequences[0]
+                        # replace IMAGE_TOKEN_INDEX (-200) for decoding readability
+                        seq = seq.clone()
+                        seq[seq == -200] = 31999
+                        text_output = tokenizer.decode(seq, skip_special_tokens=False)
+                        from utils.utils import DEFAULT_IMAGE_PATCH_TOKEN
+                        text_output = (
+                            text_output.replace(DEFAULT_IMAGE_PATCH_TOKEN, "")
+                            .replace("\n", " ")
+                            .replace("  ", " ")
+                        )
+                        print(f"[LLaVA-train] step {global_step+1}: {text_output}", flush=True)
+                except torch.cuda.OutOfMemoryError:
+                    print("[LLaVA-train] preview skipped (OOM)", flush=True)
+                except Exception as e:
+                    print(f"[LLaVA-train] preview error: {e}", flush=True)
+                finally:
+                    model.train()
 
             # Fine-grained micro-step progress (helps to see liveness during long steps)
             micro_dt = time.time() - micro_t0
@@ -887,8 +947,9 @@ def ar_validate(val_loader, model_engine, epoch, writer, args, logger, val_datas
 
         iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
         # ciou = iou_class[1]
+        # giou = acc_iou_meter.avg[1]
         ciou = iou_class
-        giou = acc_iou_meter.avg[1]
+        giou = acc_iou_meter.avg
 
         if args.local_rank == 0:
             writer.add_scalar("val/giou", giou, epoch)
