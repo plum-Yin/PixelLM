@@ -98,28 +98,44 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_images(self, images, clip_resize_list, return_project=False):
         vision_tower = self.get_model().get_vision_tower()
-        vit_attention_mask_for_llm = None
-        if hasattr(vision_tower, 'vision_tower') and isinstance(vision_tower.vision_tower, _CLIPVisionModel):
-            vit_attention_mask = torch.zeros_like(images[:, 0, :, :])
-            for i, size in enumerate(clip_resize_list):
-                vit_attention_mask[i, :size[0], :size[1]] = 1
-            with torch.no_grad():
-                patch_size = 14
-                patch_num = vit_attention_mask.shape[-1] // patch_size
-                vit_attention_mask = F.interpolate(vit_attention_mask[:, None], size=(patch_num, patch_num), mode="nearest")[:, 0]
-                vit_attention_mask_for_llm = F.interpolate(vit_attention_mask[:, None], size=(16, 16), mode="nearest")[:, 0]
-                vit_attention_mask_for_llm = vit_attention_mask_for_llm.flatten(1)
-                flatten_vit_attention_mask = vit_attention_mask.flatten(1)
-                flatten_vit_attention_mask = torch.cat((torch.ones(flatten_vit_attention_mask.shape[0], 1).to(flatten_vit_attention_mask), flatten_vit_attention_mask), dim=-1)
-            image_features, pre_image_features = vision_tower(images, attention_mask=flatten_vit_attention_mask)
-        else:
-            image_features, pre_image_features = self.get_model().get_vision_tower()(images)
+        # 统一基于 clip_resize_list 计算 ViT patch 级掩码，并派生给 LLM 的 16x16 掩码
+        vit_attention_mask = torch.zeros_like(images[:, 0, :, :])
+        for i, size in enumerate(clip_resize_list):
+            vit_attention_mask[i, :size[0], :size[1]] = 1
+        with torch.no_grad():
+            patch_size = 14
+            patch_num = vit_attention_mask.shape[-1] // patch_size
+            vit_attention_mask = F.interpolate(
+                vit_attention_mask[:, None], size=(patch_num, patch_num), mode="nearest"
+            )[:, 0]
+            vit_attention_mask_for_llm = F.interpolate(
+                vit_attention_mask[:, None], size=(16, 16), mode="nearest"
+            )[:, 0]
+            vit_attention_mask_for_llm = vit_attention_mask_for_llm.flatten(1)
+            # vision 塔用的 patch 注意力（含 CLS）
+            flatten_vit_attention_mask = vit_attention_mask.flatten(1)
+            flatten_vit_attention_mask = torch.cat(
+                (
+                    torch.ones(flatten_vit_attention_mask.shape[0], 1).to(flatten_vit_attention_mask),
+                    flatten_vit_attention_mask,
+                ),
+                dim=-1,
+            )
 
-        # image_features = self.get_model().mm_projector(image_features)
+        # 无论视觉塔类型，都传入 attention_mask（自定义塔会忽略该参数，但不影响兼容性）
+        image_features, pre_image_features = vision_tower(images, attention_mask=flatten_vit_attention_mask)
+
         if return_project:
-            # image_features = self.get_model().mm_projector(image_features)
-            pre_image_features = [self.get_model().out_mm_projector(f) if self.get_model().separate_mm_projector else self.get_model().mm_projector(f) for f in pre_image_features]
-            output_image_features = [self.get_model().out_mm_projector(image_features) if self.get_model().separate_mm_projector else self.get_model().mm_projector(image_features)]
+            pre_image_features = [
+                self.get_model().out_mm_projector(f)
+                if self.get_model().separate_mm_projector
+                else self.get_model().mm_projector(f)
+            for f in pre_image_features]
+            output_image_features = [
+                self.get_model().out_mm_projector(image_features)
+                if self.get_model().separate_mm_projector
+                else self.get_model().mm_projector(image_features)
+            ]
             output_image_features.extend(pre_image_features)
             pre_image_features = output_image_features
         return image_features, vit_attention_mask_for_llm, pre_image_features
@@ -157,16 +173,30 @@ class LlavaMetaForCausalLM(ABC):
             image_features, vit_attention_mask, pre_image_features = self.encode_images(images, clip_resize_list)
             attention_mask = torch.ones_like(input_ids).detach() if attention_mask is None else attention_mask
         # import pdb;pdb.set_trace()
+        # multi-scale特征（给分割用）始终使用致密patch特征：第一层来自 image_features（密集 I_v），其余来自 pre_image_features
         pre_image_features = [self.get_model().out_mm_projector(f) if self.get_model().separate_mm_projector else self.get_model().mm_projector(f) for f in pre_image_features]
         output_image_features = [self.get_model().out_mm_projector(image_features) if self.get_model().separate_mm_projector else self.get_model().mm_projector(image_features)]
         output_image_features.extend(pre_image_features)
         # output_image_features = output_image_features[1:]
-        n, l, c = image_features.shape
-        p_num = int(l ** 0.5)
-        image_features = F.interpolate(image_features.permute(0, 2, 1).view(n, c, p_num, p_num).float(), size=(16,16),  mode="bilinear",align_corners=False).to(image_features)
-        image_features = image_features.flatten(-2).permute(0, 2, 1)
-        image_features = self.get_model().mm_projector(image_features)
-        vit_attention_mask = torch.ones_like(image_features[:,:,0]).detach() if vit_attention_mask is None else vit_attention_mask
+        # LLM 路径：若存在 Q-Former，则使用其短序列输出作为图像token；否则回退到致密网格下采样到16x16
+        vision_tower = self.get_vision_tower()
+        if hasattr(vision_tower, 'qformer') and vision_tower.qformer is not None:
+            print("Using Q-Former output as image tokens.")
+            q_tokens = vision_tower.forward_qformer(images=None, image_features=image_features)  # [B, Q, Cclip]
+            image_features = self.get_model().mm_projector(q_tokens)  # [B, Q, H]
+            vit_attention_mask = torch.ones_like(image_features[:, :, 0]).detach()
+        else:
+            n, l, c = image_features.shape
+            p_num = int(l ** 0.5)
+            image_features = F.interpolate(
+                image_features.permute(0, 2, 1).view(n, c, p_num, p_num).float(),
+                size=(16, 16),
+                mode="bilinear",
+                align_corners=False,
+            ).to(image_features)
+            image_features = image_features.flatten(-2).permute(0, 2, 1)
+            image_features = self.get_model().mm_projector(image_features)
+            vit_attention_mask = torch.ones_like(image_features[:, :, 0]).detach() if vit_attention_mask is None else vit_attention_mask
 
         new_input_embeds = []
         new_attention_mask = []

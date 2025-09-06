@@ -25,21 +25,36 @@ except Exception:
 
 class OptionalReNorm(nn.Module):
     """
-    将 CLIP 范围 [-1,1] 的图像近似还原到 [0,1]，再做 ImageNet 规范化，供 DINO 使用。
+    将 CLIP 预处理后的像素（均值/方差归一化）还原到 [0,1]，再做 ImageNet 规范化，供 DINO/ViT 使用。
+    注意：输入应为 CLIPImageProcessor.preprocess 的 `pixel_values`（CHW，float，已归一化）。
     """
-    def __init__(self, enable=True):
+    def __init__(self, enable: bool = True, clip_mean: torch.Tensor = None, clip_std: torch.Tensor = None):
         super().__init__()
         self.enable = enable
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        self.register_buffer('mean', mean)
-        self.register_buffer('std', std)
+        # ImageNet/DINO 标准化参数（[0,1] 空间）
+        imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        self.register_buffer('imagenet_mean', imagenet_mean)
+        self.register_buffer('imagenet_std', imagenet_std)
 
-    def forward(self, x_clip_norm):
+        # CLIP 预处理参数（[0,1] 空间），用于逆变换回 [0,1]
+        if clip_mean is None or clip_std is None:
+            # 若未提供，则退化为直传（不推荐，但保证健壮性）
+            clip_mean = torch.zeros(1, 3, 1, 1)
+            clip_std = torch.ones(1, 3, 1, 1)
+        self.register_buffer('clip_mean', clip_mean.view(1, 3, 1, 1))
+        self.register_buffer('clip_std', clip_std.view(1, 3, 1, 1))
+
+        # 记录是否已初始化
+        self.initialized = True
+
+    def forward(self, x_clip_norm: torch.Tensor) -> torch.Tensor:
         if not self.enable:
             return x_clip_norm
-        x01 = (x_clip_norm + 1.0) * 0.5
-        return (x01 - self.mean) / self.std
+        # 逆 CLIP 归一化：x01 ∈ [0,1]
+        x01 = x_clip_norm * self.clip_std + self.clip_mean
+        # 再做 ImageNet 标准化
+        return (x01 - self.imagenet_mean) / self.imagenet_std
 
 
 class DINOv2HFWrapper(nn.Module):
@@ -120,6 +135,7 @@ class EvaDinoQFormerVisionTower(nn.Module):
         try:
             self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
         except Exception:
+            print(f"Warning: failed to load image_processor for {self.vision_tower_name}, using openai/clip-vit-large-patch14 instead.")
             self.image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
 
         # 模块占位
@@ -130,8 +146,10 @@ class EvaDinoQFormerVisionTower(nn.Module):
         self.qformer = None
         self.q_proj_in = None
         self.q_proj_out = None
+        self.q_kv_proj = None
         self.learnable_query = None
         self._clip_dim = None
+        self._qformer_debug_once = False
 
         if not delay_load:
             self.load_model()
@@ -193,7 +211,14 @@ class EvaDinoQFormerVisionTower(nn.Module):
             dino_model_name = "facebook/dinov2-large"
         self.dino = DINOv2HFWrapper(dino_model_name)
         dino_dim = self.dino.embed_dim
-        self.imagenet_norm = OptionalReNorm(enable=True)
+        # 使用实际的 CLIP 均值/方差做逆归一化，再做 ImageNet 规范化
+        try:
+            clip_mean = torch.tensor(self.image_processor.image_mean).view(1, 3, 1, 1)
+            clip_std = torch.tensor(self.image_processor.image_std).view(1, 3, 1, 1)
+        except Exception:
+            clip_mean = torch.zeros(1, 3, 1, 1)
+            clip_std = torch.ones(1, 3, 1, 1)
+        self.imagenet_norm = OptionalReNorm(enable=True, clip_mean=clip_mean, clip_std=clip_std)
 
         # 3) 维度对齐 + Cross Attention
         self.dino_proj = nn.Linear(dino_dim, clip_dim, bias=False)
@@ -213,6 +238,12 @@ class EvaDinoQFormerVisionTower(nn.Module):
             else:
                 self.q_proj_in = nn.Identity()
                 self.q_proj_out = nn.Identity()
+            # 对 encoder_hidden_states (I_v) 做 KV 侧维度对齐
+            qformer_kv_dim = getattr(self.qformer.config, "encoder_hidden_size", qformer_dim)
+            if qformer_kv_dim != clip_dim:
+                self.q_kv_proj = nn.Linear(clip_dim, qformer_kv_dim, bias=False)
+            else:
+                self.q_kv_proj = nn.Identity()
             num_query = getattr(self.args, "num_query", 32)
             self.learnable_query = nn.Parameter(torch.randn(num_query, clip_dim))
 
@@ -241,7 +272,8 @@ class EvaDinoQFormerVisionTower(nn.Module):
         I_clip = vt(images_clip_in, output_hidden_states=False).last_hidden_state[:, 1:, :]
         # DINO：ImageNet 归一化
         I_dino_in = self.imagenet_norm(images)
-        I_dino = self.dino_proj(self.dino(I_dino_in).last_hidden_state)
+        # 大多数 HF 视觉骨干使用 float32；为稳妥起见在此处转为 float32
+        I_dino = self.dino_proj(self.dino(I_dino_in.float()).last_hidden_state)
 
         # Cross-Attention 融合
         I_v, _ = self.cross_attention(I_clip, I_dino, I_dino)
@@ -250,33 +282,68 @@ class EvaDinoQFormerVisionTower(nn.Module):
         return image_features, pre_image_features
 
     @torch.no_grad()
-    def forward_qformer(self, images, text_embeds=None):
+    def forward_qformer(self, images=None, text_embeds=None, image_features=None):
         if self.qformer is None:
             raise RuntimeError("Q-Former not initialized; provide qformer_path in args.")
         vt = self.eva_clip
-        images_clip_in = images
-        try:
-            expected = vt.vision_model.embeddings.image_size
-        except Exception:
-            expected = None
-        if expected is not None:
-            h, w = images.shape[-2:]
-            if h != expected or w != expected:
-                images_clip_in = F.interpolate(
-                    images, size=(expected, expected), mode="bilinear", align_corners=False
-                )
-        I_clip = vt(images_clip_in, output_hidden_states=False).last_hidden_state[:, 1:, :]
-        I_dino_in = self.imagenet_norm(images)
-        I_dino = self.dino_proj(self.dino(I_dino_in).last_hidden_state)
-        I_v, _ = self.cross_attention(I_clip, I_dino, I_dino)
+        # Use cached dense image features if provided to avoid recomputing vision tower
+        if image_features is not None:
+            I_v = image_features
+        else:
+            assert images is not None, "forward_qformer requires either images or image_features"
+            images_clip_in = images
+            try:
+                expected = vt.vision_model.embeddings.image_size
+            except Exception:
+                expected = None
+            if expected is not None:
+                h, w = images.shape[-2:]
+                if h != expected or w != expected:
+                    images_clip_in = F.interpolate(
+                        images, size=(expected, expected), mode="bilinear", align_corners=False
+                    )
+            I_clip = vt(images_clip_in, output_hidden_states=False).last_hidden_state[:, 1:, :]
+            I_dino_in = self.imagenet_norm(images)
+            I_dino = self.dino_proj(self.dino(I_dino_in.float()).last_hidden_state)
+            I_v, _ = self.cross_attention(I_clip, I_dino, I_dino)
 
-        B = images.size(0)
+        B = (images.size(0) if images is not None else I_v.size(0))
         learnable_q = self.learnable_query.unsqueeze(0).expand(B, -1, -1)
         q_input = torch.cat([learnable_q, text_embeds], dim=1) if text_embeds is not None else learnable_q
         q_input = self.q_proj_in(q_input)
-        qf_out = self.qformer(query_embeds=q_input, encoder_hidden_states=I_v).last_hidden_state
+
+        # 将密集图像 token 映射到 Q-Former 期望的 encoder_hidden_size
+        I_v_kv = self.q_kv_proj(I_v) if self.q_kv_proj is not None else I_v
+
+        # 确保 dtype/device 与 Q-Former 一致
+        try:
+            qf_param = next(self.qformer.parameters())
+            q_device, q_dtype = qf_param.device, qf_param.dtype
+        except StopIteration:
+            q_device, q_dtype = self.device, q_input.dtype
+        q_input = q_input.to(device=q_device, dtype=q_dtype)
+        I_v_kv = I_v_kv.to(device=q_device, dtype=q_dtype)
+
+        # 一次性调试信息与形状断言（帮助定位维度错配）
+        if not self._qformer_debug_once:
+            clip_dim = self._clip_dim
+            q_dim = getattr(self.qformer.config, "hidden_size", None)
+            kv_dim = getattr(self.qformer.config, "encoder_hidden_size", q_dim)
+            print(f"[QFormer Debug] clip_dim={clip_dim}, qformer_q_dim={q_dim}, qformer_kv_dim={kv_dim}")
+            print(f"[QFormer Debug] q_input={tuple(q_input.shape)}, I_v_kv={tuple(I_v_kv.shape)}")
+            self._qformer_debug_once = True
+
+        assert (
+            q_input.shape[-1] == getattr(self.qformer.config, "hidden_size")
+        ), f"Q-Former query dim mismatch: {q_input.shape[-1]} vs {self.qformer.config.hidden_size}"
+        assert (
+            I_v_kv.shape[-1] == getattr(self.qformer.config, "encoder_hidden_size", self.qformer.config.hidden_size)
+        ), f"Q-Former KV dim mismatch: {I_v_kv.shape[-1]} vs {getattr(self.qformer.config, 'encoder_hidden_size', self.qformer.config.hidden_size)}"
+
+        qf_out = self.qformer(query_embeds=q_input, encoder_hidden_states=I_v_kv).last_hidden_state
         img_embeds = qf_out[:, :self.learnable_query.size(0), :]
-        img_embeds = self.q_proj_out(img_embeds).to(images.dtype)
+        target_dtype = (images.dtype if images is not None else q_dtype)
+        img_embeds = self.q_proj_out(img_embeds).to(target_dtype)
         return img_embeds
 
     @property

@@ -3,7 +3,7 @@
 
 # ======== SLURM Job Configuration ========
 #SBATCH --job-name=pixellm_train
-#SBATCH --time=00:30:00
+#SBATCH --time=03:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --open-mode=truncate
 #SBATCH --output=/data/zyin418/mllm/PixelLM/output/output.log
@@ -23,7 +23,7 @@ conda activate pixellm
 # Run your Python script or other commands
 # export PIXELLM_DEBUG=1
 
-deepspeed --num_gpus 1 --master_port=24999 train_ds.py \
+deepspeed --num_gpus 1 --master_port=24990 train_ds.py \
     --dataset reason_seg \
     --sample_rates 1 \
     --dataset_dir ../dataset \
@@ -32,5 +32,12 @@ deepspeed --num_gpus 1 --master_port=24999 train_ds.py \
     --version "liuhaotian/llava-v1.6-vicuna-7b" \
     --conv_type "llava_llama_2" \
     --epochs 10 \
-    --steps_per_epoch 5 \
-    --batch_size 32 \
+    --steps_per_epoch 1 \
+    --workers 2 \
+    --batch_size 2 \
+    --image_feature_scale_num 1 \
+    --grad_accumulation_steps 1 \
+    --resize_vision_tower_size 224 \
+    --eva_clip_path timm/eva02_large_patch14_clip_336.merged2b_s6b_b61k \
+    --dino_path timm/vit_large_patch14_reg4_dinov2.lvd142m \
+    --qformer_path "" \
