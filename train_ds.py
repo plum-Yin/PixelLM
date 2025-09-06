@@ -647,18 +647,30 @@ def train(
                             return_dict_in_generate=True,
                             clip_resize_list=clip_resize_list,
                         )
-                        seq = outputs.sequences[0]
+                        
+                        full_seq = outputs.sequences[0]
+                        # 仅解码新增的生成部分，避免把整段 prompt（含特殊符号、<im_start>/<im_end>）也打印出来
+                        prompt_len = input_ids.shape[0]
+                        # print question and answer separately
+                        question = full_seq[:prompt_len]
                         # replace IMAGE_TOKEN_INDEX (-200) for decoding readability
-                        seq = seq.clone()
-                        seq[seq == -200] = 31999
-                        text_output = tokenizer.decode(seq, skip_special_tokens=False)
+                        question[question == -200] = 31999
+                        question_output = tokenizer.decode(question, skip_special_tokens=False)
+                        response = full_seq[prompt_len:]
+                        response_output = tokenizer.decode(response, skip_special_tokens=False)
+                        
                         from utils.utils import DEFAULT_IMAGE_PATCH_TOKEN
-                        text_output = (
-                            text_output.replace(DEFAULT_IMAGE_PATCH_TOKEN, "")
+                        question_output = (
+                            question_output.replace(DEFAULT_IMAGE_PATCH_TOKEN, "")
                             .replace("\n", " ")
                             .replace("  ", " ")
                         )
-                        print(f"[LLaVA-train] step {global_step+1}: {text_output}", flush=True)
+                        response_output = (
+                            response_output.replace(DEFAULT_IMAGE_PATCH_TOKEN, "")
+                            .replace("\n", " ")
+                            .replace("  ", " ") 
+                        )
+                        print(f"[LLaVA-train] step {global_step+1}:\nquestion={question_output}\nresponse={response_output}", flush=True)
                 except torch.cuda.OutOfMemoryError:
                     print("[LLaVA-train] preview skipped (OOM)", flush=True)
                 except Exception as e:

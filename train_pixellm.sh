@@ -41,3 +41,5 @@ deepspeed --num_gpus 1 --master_port=24990 train_ds.py \
     --eva_clip_path timm/eva02_large_patch14_clip_336.merged2b_s6b_b61k \
     --dino_path timm/vit_large_patch14_reg4_dinov2.lvd142m \
     --qformer_path "" \
+    --print_text_every 1 \
+    --peek_max_new_tokens 64
