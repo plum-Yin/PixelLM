@@ -633,30 +633,38 @@ def train(
                         # pick first image/conversation in this micro-batch
                         images_clip = input_dict["images_clip"][:1]
                         clip_resize_list = [input_dict["clip_resize_list"][0]]
-                        offset = input_dict["offset"]
-                        start_i = int(offset[0].item())
-                        # safeguard: if offset has >=2 entries
-                        pick_idx = start_i
+                        # Choose first sample in this micro-batch for preview
+                        pick_idx = 0
                         input_ids = input_dict["input_ids"][pick_idx]
+                        # Print the exact input text (pre-tokenized) for verification
+                        conv_list = input_dict.get("conversation_list", [])
+                        if conv_list:
+                            print(f"[LLaVA-train] input_text: {conv_list[pick_idx]}", flush=True)
                         outputs = model.base_model.generate(
                             images=images_clip,
                             input_ids=input_ids[None],
                             max_new_tokens=int(args.peek_max_new_tokens),
+                            min_new_tokens=1,
                             num_beams=1,
                             output_hidden_states=False,
                             return_dict_in_generate=True,
                             clip_resize_list=clip_resize_list,
                         )
-                        
                         full_seq = outputs.sequences[0]
-                        # 仅解码新增的生成部分，避免把整段 prompt（含特殊符号、<im_start>/<im_end>）也打印出来
-                        prompt_len = input_ids.shape[0]
-                        # print question and answer separately
-                        question = full_seq[:prompt_len]
-                        # replace IMAGE_TOKEN_INDEX (-200) for decoding readability
+                        # Robust split: align longest common prefix between prompt and generated sequence
+                        real_prompt_len = int((input_ids != tokenizer.pad_token_id).sum().item())
+                        limit = min(real_prompt_len, full_seq.shape[0])
+                        pref_len = 0
+                        while pref_len < limit and full_seq[pref_len].item() == input_ids[pref_len].item():
+                            pref_len += 1
+                        # question part (display the prompt itself)
+                        question = input_ids[:real_prompt_len].clone()
                         question[question == -200] = 31999
                         question_output = tokenizer.decode(question, skip_special_tokens=False)
-                        response = full_seq[prompt_len:]
+                        # response: strictly the generated suffix
+                        response = full_seq[pref_len:]
+                        if response.numel() > 0:
+                            response = response[response >= 0]
                         response_output = tokenizer.decode(response, skip_special_tokens=False)
                         
                         from utils.utils import DEFAULT_IMAGE_PATCH_TOKEN
@@ -670,7 +678,7 @@ def train(
                             .replace("\n", " ")
                             .replace("  ", " ") 
                         )
-                        print(f"[LLaVA-train] step {global_step+1}:\nquestion={question_output}\nresponse={response_output}", flush=True)
+                        print(f"[LLaVA-train] step {global_step+1}:\nquestion={question_output}\nresponse={response_output if len(response_output)>0 else '<empty>'}", flush=True)
                 except torch.cuda.OutOfMemoryError:
                     print("[LLaVA-train] preview skipped (OOM)", flush=True)
                 except Exception as e:
