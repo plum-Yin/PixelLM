@@ -1,9 +1,26 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import timm
 from types import SimpleNamespace
-from transformers import CLIPVisionModel, Blip2QFormerModel, CLIPImageProcessor
+from transformers import (
+    CLIPVisionModel,
+    Blip2QFormerModel,
+    CLIPImageProcessor,
+)
+try:
+    # Available in many Transformers versions; used if present
+    from transformers import Dinov2Model  # type: ignore
+    _HAS_DINOV2 = True
+except Exception:
+    Dinov2Model = None  # type: ignore
+    _HAS_DINOV2 = False
+try:
+    # ViT fallback if Dinov2 is unavailable
+    from transformers import ViTModel  # type: ignore
+    _HAS_VIT = True
+except Exception:
+    ViTModel = None  # type: ignore
+    _HAS_VIT = False
 
 
 class OptionalReNorm(nn.Module):
@@ -25,24 +42,56 @@ class OptionalReNorm(nn.Module):
         return (x01 - self.mean) / self.std
 
 
-class DINOv2TimmWrapper(nn.Module):
+class DINOv2HFWrapper(nn.Module):
     """
-    通过 timm 加载 DINOv2，并返回 [B, N, D] 的 patch tokens
+    使用 Hugging Face Transformers 加载 DINOv2；若不可用则回退到 ViT。
+    - 返回对象包含 last_hidden_state（去除 CLS）: [B, N, D]
+    - 仅依赖 transformers==4.31.0 生态，不引入 timm
     """
-    def __init__(self, model_name="vit_large_patch14_dinov2.lvd142m"):
+    def __init__(self, model_name_or_path: str = "facebook/dinov2-large"):
         super().__init__()
-        self.model = timm.create_model(model_name, pretrained=True)
-        self.embed_dim = self.model.embed_dim  # 例如 vit_large_patch14_dinov2 = 1024
+        self.backend = None
+        self.embed_dim = None
 
-    def forward(self, images):
-        # timm 的 ViT forward_features 返回字典，x 为 [B, N+1, D] (含 CLS)
-        feats = self.model.forward_features(images)
-        if isinstance(feats, dict) and "x" in feats:
-            tokens = feats["x"]  # [B, N+1, D]
-        else:
-            tokens = feats
-        # 去掉 CLS token
-        patch_tokens = tokens[:, 1:, :]  # [B, N, D]
+        model = None
+        # 1) 优先 DINOv2（若 transformers 版本支持，且权重可用）
+        if _HAS_DINOV2 and Dinov2Model is not None:
+            try:
+                model = Dinov2Model.from_pretrained(model_name_or_path)
+                self.backend = "dinov2"
+            except Exception:
+                model = None
+
+        # 2) 回退 ViT（大概率 transformers 都可用）
+        if model is None and _HAS_VIT and ViTModel is not None:
+            try:
+                # 合理的 ViT 大模型作为近似替代
+                fallback = (
+                    "google/vit-large-patch16-224-in21k"
+                    if model_name_or_path is None
+                    else model_name_or_path
+                )
+                # 若传入的是 timm 风格名称，直接忽略并使用 fallback
+                if "dinov2" in str(model_name_or_path).lower() or \
+                   "vit_large_patch" in str(model_name_or_path).lower():
+                    fallback = "google/vit-large-patch16-224-in21k"
+                model = ViTModel.from_pretrained(fallback)
+                self.backend = "vit"
+            except Exception:
+                model = None
+
+        if model is None:
+            raise RuntimeError(
+                "Failed to load vision backbone from transformers. Dinov2Model/ViTModel unavailable."
+            )
+
+        self.model = model
+        self.embed_dim = getattr(self.model.config, "hidden_size")
+
+    def forward(self, images: torch.Tensor):
+        outputs = self.model(pixel_values=images)
+        tokens = outputs.last_hidden_state  # [B, 1+N, D]
+        patch_tokens = tokens[:, 1:, :]  # 去 CLS -> [B, N, D]
         return SimpleNamespace(last_hidden_state=patch_tokens)
 
 
@@ -137,9 +186,12 @@ class EvaDinoQFormerVisionTower(nn.Module):
                 vt.vision_model.embeddings.position_ids.to(origin_position_embedding_weight.device)
             )
 
-        # 2) DINOv2（默认 timm）
-        dino_model_name = getattr(self.args, "dino_model_name", "vit_large_patch14_dinov2.lvd142m")
-        self.dino = DINOv2TimmWrapper(dino_model_name)
+        # 2) DINOv2（transformers 实现）
+        # 兼容外部传参名：优先使用 --dino_path；若未提供则使用 Dinov2 预设
+        dino_model_name = getattr(self.args, "dino_path", None)
+        if dino_model_name in (None, "",):
+            dino_model_name = "facebook/dinov2-large"
+        self.dino = DINOv2HFWrapper(dino_model_name)
         dino_dim = self.dino.embed_dim
         self.imagenet_norm = OptionalReNorm(enable=True)
 
@@ -171,8 +223,22 @@ class EvaDinoQFormerVisionTower(nn.Module):
     @torch.no_grad()
     def forward(self, images, attention_mask=None):
         assert self.is_loaded, "Vision tower not loaded; call load_model() first."
+        # 若输入分辨率与 CLIP 位置编码不一致，则在前向时自适应到设定的 image_size
+        images_clip_in = images
+        vt = self.eva_clip
+        try:
+            expected = vt.vision_model.embeddings.image_size
+        except Exception:
+            expected = None
+        if expected is not None:
+            h, w = images.shape[-2:]
+            if h != expected or w != expected:
+                images_clip_in = F.interpolate(
+                    images, size=(expected, expected), mode="bilinear", align_corners=False
+                )
+
         # EVA-CLIP：去 CLS
-        I_clip = self.eva_clip(images, output_hidden_states=False).last_hidden_state[:, 1:, :]
+        I_clip = vt(images_clip_in, output_hidden_states=False).last_hidden_state[:, 1:, :]
         # DINO：ImageNet 归一化
         I_dino_in = self.imagenet_norm(images)
         I_dino = self.dino_proj(self.dino(I_dino_in).last_hidden_state)
@@ -187,7 +253,19 @@ class EvaDinoQFormerVisionTower(nn.Module):
     def forward_qformer(self, images, text_embeds=None):
         if self.qformer is None:
             raise RuntimeError("Q-Former not initialized; provide qformer_path in args.")
-        I_clip = self.eva_clip(images, output_hidden_states=False).last_hidden_state[:, 1:, :]
+        vt = self.eva_clip
+        images_clip_in = images
+        try:
+            expected = vt.vision_model.embeddings.image_size
+        except Exception:
+            expected = None
+        if expected is not None:
+            h, w = images.shape[-2:]
+            if h != expected or w != expected:
+                images_clip_in = F.interpolate(
+                    images, size=(expected, expected), mode="bilinear", align_corners=False
+                )
+        I_clip = vt(images_clip_in, output_hidden_states=False).last_hidden_state[:, 1:, :]
         I_dino_in = self.imagenet_norm(images)
         I_dino = self.dino_proj(self.dino(I_dino_in).last_hidden_state)
         I_v, _ = self.cross_attention(I_clip, I_dino, I_dino)

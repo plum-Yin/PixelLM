@@ -1,5 +1,5 @@
 {
-    "crop_size": 518,
+    "crop_size": 224,
     "do_center_crop": true,
     "do_normalize": true,
     "do_resize": true,
@@ -15,5 +15,5 @@
       0.27577711
     ],
     "resample": 3,
-    "size": 518
+    "size": 224
   }

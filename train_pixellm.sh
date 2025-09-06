@@ -21,12 +21,16 @@ conda activate pixellm
 
 
 # Run your Python script or other commands
-echo "Starting training job..."
-deepspeed --num_gpus 1 train_ds.py \
+# export PIXELLM_DEBUG=1
+
+deepspeed --num_gpus 1 --master_port=24999 train_ds.py \
     --dataset reason_seg \
     --sample_rates 1 \
     --dataset_dir ../dataset \
-    --preprocessor_config configs/preprocessor_518.json \
+    --preprocessor_config configs/preprocessor_224.json \
     --vision_pretrained sam_vit_h_4b8939.pth \
-    --version "liuhaotian/llava-v1.6-vicuna-7b"
-    
+    --version "liuhaotian/llava-v1.6-vicuna-7b" \
+    --conv_type "llava_llama_2" \
+    --epochs 10 \
+    --steps_per_epoch 5 \
+    --batch_size 32 \

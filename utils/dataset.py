@@ -37,6 +37,10 @@ from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 def collate_fn(
     batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
 ):
+    # Gate debug prints via env var to reduce log noise
+    DEBUG = str(os.environ.get("PIXELLM_DEBUG", "")).lower() in ("1", "true", "yes", "y")
+    if DEBUG:
+        print(f"[collate_fn] conv_type={conv_type}, use_mm_start_end={use_mm_start_end}, local_rank={local_rank}")
     image_path_list = []
     images_list = []
     images_clip_list = []
@@ -104,23 +108,75 @@ def collate_fn(
     conv = conversation_lib.conv_templates['chatml'].copy() if conv_type == "chatml" else conversation_lib.default_conversation.copy()
     targets = input_ids.clone()
 
-    if conv_type == "llava_v1" or "chatml":
-        sep = conv.sep + conv.roles[1] + ": "
-    else:
+    if conv_type == "chatml":
+        sep = conv.sep  # '###'
+    elif conv_type == "llava_llama_2" or getattr(conv, "sep_style", None) == conversation_lib.SeparatorStyle.LLAMA_2:
         sep = "[/INST] "
+    else:
+        sep = conv.sep + conv.roles[1] + ": "
+
+    
     # print(conv)
     for conversation, target in zip(conversation_list, targets):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
-        if conv.sep2 not in conversation:
-            break
+        if not conv.sep2 or conv.sep2 not in conversation:
+            # skip conversations that don't contain end-of-round sep2
+            continue
         rounds = conversation.split(conv.sep2)
-        cur_len = 1
-        target[:cur_len] = IGNORE_INDEX
+        # 在 rounds = conversation.split(conv.sep2) 之后
+        is_llama2 = (conv_type == "llava_llama_2") or (
+            getattr(conv, "sep_style", None) == conversation_lib.SeparatorStyle.LLAMA_2
+        )
+        cur_len = 0 if is_llama2 else 1
+        if cur_len > 0:
+            target[:cur_len] = IGNORE_INDEX
+
+
+        # debug 输出
+        if DEBUG and local_rank in (-1, 0):
+            full_ids = tokenizer_image_token(conversation, tokenizer)  # 整段 prompt 的 token 序列（不含 pad）
+            bos_id, eos_id = tokenizer.bos_token_id, tokenizer.eos_token_id
+            first_id = full_ids[0] if len(full_ids) > 0 else None
+            print("[len-debug] has_full_bos:", (first_id == bos_id), 
+                "first_id:", first_id, "bos_id:", bos_id, "eos_id:", eos_id)
+            # 每轮的首 token（看是否包含 <s>）
+            round_first_ids = []
+            for idx, rou in enumerate(conversation.split(conv.sep2)):
+                if rou == "":
+                    break
+                ids = tokenizer_image_token(rou, tokenizer)
+                round_first_ids.append(ids[0] if len(ids)>0 else None)
+            sep2_ids = tokenizer(conv.sep2, add_special_tokens=False).input_ids if conv.sep2 is not None else []
+            print("[len-debug] round_first_ids(head):", round_first_ids[:5], 
+                "len(sep2_ids):", len(sep2_ids), "sep2_ids:", sep2_ids)
+
+            # 对比总长与现有计算
+            sum_round = 0
+            for idx, rou in enumerate(conversation.split(conv.sep2)):
+                if rou == "":
+                    break
+                sum_round += len(tokenizer_image_token(rou, tokenizer))
+            print("[len-debug] total_len(full_ids):", len(full_ids), 
+                "sum_round_len:", sum_round)
+        
+        sep2_ids_main = tokenizer(conv.sep2, add_special_tokens=False).input_ids if conv.sep2 is not None else []
+        sep2_len = len(sep2_ids_main)
+        
+        rounds_non_empty = [r for r in conversation.split(conv.sep2) if r != ""]
+        sum_round = sum(len(tokenizer_image_token(r, tokenizer)) for r in rounds_non_empty)
+        sep2_ids_main = tokenizer(conv.sep2, add_special_tokens=False).input_ids if conv.sep2 is not None else []
+        sep2_len = len(sep2_ids_main)
+        expected_total = sum_round + sep2_len * len(rounds_non_empty)
+        if DEBUG and local_rank in (-1, 0):
+            print(f"[pre-loop] sum_round_len={sum_round}, rounds_cnt={len(rounds_non_empty)}, sep2_len={sep2_len}, expected_total={expected_total}, total_len={total_len}")
+
+
         for i, rou in enumerate(rounds):
             if rou == "":
                 break
             if conv_type == "chatml":
                 if DEFAULT_IMAGE_TOKEN in conversation:
+                    # include end-of-round sep2 in counting, but avoid double-counting BOS
                     round_len = len(tokenizer_image_token(rou, tokenizer))
                     instruction_len = len(tokenizer_image_token(rou+sep, tokenizer)) - 2
                 else:
@@ -130,15 +186,18 @@ def collate_fn(
                 if i == 0:
                     target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
-                # cur_len += round_len
-                    
             else:
                 parts = rou.split(sep)
-                # if len(parts) != 2:
-                #     break
+                
+                if len(parts) != 2 and DEBUG and local_rank in (-1, 0):
+                    print(f"[split-debug] conv_type={conv_type}, sep_style={getattr(conv.sep_style,'name',str(conv.sep_style))}, "
+                        f"sep_used={repr(sep)}, has_llama2_sep={rou.count('[/INST] ')}, "
+                        f"has_v1_sep={rou.count(conv.sep + conv.roles[1] + ': ')}", flush=True)
+
                 assert len(parts) == 2, (len(parts), rou)
                 parts[0] += sep
 
+                # For LLaMA-2 style, avoid appending sep2 here to prevent double-counting EOS   
                 if DEFAULT_IMAGE_TOKEN in conversation:
                     round_len = len(tokenizer_image_token(rou, tokenizer))
                     instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
@@ -149,23 +208,113 @@ def collate_fn(
                 target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
                 cur_len += round_len
+                # 仅 LLaMA-2 下补齐每轮末尾的 sep2（</s>）
+                if is_llama2 and sep2_len > 0:
+                    cur_len += sep2_len
+        
+        
         if conv_type == "chatml":
             cur_len = total_len
+        # 动态对齐（LLaMA-2）：当我们因每轮附加 sep2 导致 cur_len 与实际 target 长度不一致时，
+        # 以 target 的真实非 PAD 长度为准进行对齐，避免 off-by-one。
+        elif is_llama2 and cur_len != total_len:
+            if DEBUG and local_rank in (-1, 0):
+                print(f"[adjust] llama2 align cur_len: {cur_len} -> {total_len} (diff={cur_len-total_len})")
+            cur_len = total_len
         target[cur_len:] = IGNORE_INDEX
+        
+        # debug 输出
+        if DEBUG and cur_len < tokenizer.model_max_length and cur_len != total_len:
+            try:
+                # use the same separator as main logic for debug
+                sep_debug = sep
+                sep2_debug = conv.sep2
+                sep2_ids = tokenizer(sep2_debug, add_special_tokens=False).input_ids if sep2_debug is not None else []
+                rounds = conversation.split(conv.sep2) if conv.sep2 is not None else [conversation]
 
-        if False:
-            z = target.clone()
-            z = torch.where(z == IGNORE_INDEX, tokenizer.unk_token_id, z)
-            if local_rank == 0:
-                print(
-                    "conversation: ",
-                    conversation,
-                    "tokenizer.decode(z): ",
-                    tokenizer.decode(z),
-                )
-        # print(tokenizer.model_max_length, cur_len, total_len)
+                # 逐轮统计
+                per_round_len = []
+                per_inst_len = []
+                per_round_head = []
+                per_round_tail = []
+                for i, rou in enumerate(rounds):
+                    if rou == "":
+                        break
+                    # 拆 assistant 分隔
+                    parts = rou.split(sep_debug)
+                    if len(parts) != 2:
+                        print("="*20)
+                        print(f"[collate_fn debug] bad split at round {i}: len(parts)={len(parts)}; sep='{sep_debug}'")
+                        print("="*60)
+                        break
+                    # 计算每轮长度
+                    if DEFAULT_IMAGE_TOKEN in conversation:
+                        rou_ids = tokenizer_image_token(rou, tokenizer)
+                        inst_ids = tokenizer_image_token(parts[0], tokenizer)
+                        rl = len(rou_ids)
+                        il = len(inst_ids) - 2
+                    else:
+                        rou_ids = tokenizer(rou).input_ids
+                        inst_ids = tokenizer(parts[0]).input_ids
+                        rl = len(rou_ids)
+                        il = len(inst_ids) - 2
+                    per_round_len.append(rl)
+                    per_inst_len.append(il)
+                    if i < 2:  # 仅记录前两轮的首尾 token，避免日志过多
+                        per_round_head.append(rou_ids[:8])
+                        per_round_tail.append(rou_ids[-8:])
+
+                sum_round = sum(per_round_len)
+                # 估算包含每轮 sep2 后的长度（每轮末尾一个 sep2）
+                sum_round_with_sep2 = sum_round + len(sep2_ids) * len(per_round_len)
+
+                # 完整 prompt 的 token
+                full_ids = tokenizer_image_token(conversation, tokenizer)
+                full_head = full_ids[:12]
+                full_tail = full_ids[-12:]
+                bos_id, eos_id = tokenizer.bos_token_id, tokenizer.eos_token_id
+                full_eos_cnt = sum(1 for x in full_ids if x == eos_id)
+                full_bos_cnt = sum(1 for x in full_ids if x == bos_id)
+                ends_with_sep2 = conversation.endswith(sep2_debug if sep2_debug is not None else "")
+
+                # 备选长度：不计入每轮 sep2
+                cur_len_no_sep2 = sum_round if (conv_type == "llava_llama_2") else cur_len
+
+                print("[collate_fn debug] mismatch detected")
+                print(f"  conv_type={conv_type}, conv.sep='{conv.sep}', conv.sep2='{conv.sep2}', sep='{sep_debug}'")
+                print(f"  total_len={total_len}, cur_len={cur_len}, cur_len_no_sep2={cur_len_no_sep2}, #rounds={len(per_round_len)}")
+                print(f"  len(sep2_ids)={len(sep2_ids)}, sep2_ids(head)={sep2_ids[:5]}")
+                print(f"  sum_round_len={sum_round}, sum_round_len+sep2_each_round={sum_round_with_sep2}")
+                print(f"  1+sum_round_len={1+sum_round} vs total_len={total_len}")
+                print(f"  per_round_len(head)={per_round_len[:5]}, per_inst_len(head)={per_inst_len[:5]}")
+                # 额外：输出完整 token 的首尾、BOS/EOS 计数以及结尾是否包含 sep2
+                print(f"  full_ids(head)={full_head}, full_ids(tail)={full_tail}")
+                print(f"  bos_id={bos_id}, eos_id={eos_id}, full_bos_cnt={full_bos_cnt}, full_eos_cnt={full_eos_cnt}, endswith_sep2={ends_with_sep2}")
+                if len(per_round_head) > 0:
+                    print(f"  round0(head)={per_round_head[0]}, round0(tail)={per_round_tail[0]}")
+                if len(per_round_head) > 1:
+                    print(f"  round1(head)={per_round_head[1]}, round1(tail)={per_round_tail[1]}")
+                # 比对 target 实际非 PAD 的 token 首尾
+                try:
+                    target_nonpad = target[target != tokenizer.pad_token_id].tolist()
+                    target_head = target_nonpad[:12]
+                    target_tail = target_nonpad[-12:]
+                    print(f"  target_ids(head)={target_head}, target_ids(tail)={target_tail}")
+                    if len(target_tail) > 0:
+                        print(f"  target_tail_last={target_tail[-1]} (expect eos_id={eos_id})")
+                except Exception as _e:
+                    print(f"  [collate_fn debug] target dump failed: {_e}")
+                # 可选：输出对话前 300 字符检查模板
+                print(f"conversation_preview={conversation[:300].replace(chr(10), ' ')}...")
+
+            except Exception as e:
+                print(f"[collate_fn debug] exception during debug print: {e}")
+        if DEBUG and local_rank in (-1, 0):
+            print(f"[final-debug] cur_len={cur_len}, total_len={total_len} (should equal)")
+        
         if cur_len < tokenizer.model_max_length:
             assert cur_len == total_len
+
 
     if inferences[0] == False:
         truncate_len = tokenizer.model_max_length - 255

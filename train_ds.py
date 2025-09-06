@@ -35,34 +35,17 @@ def parse_args(args):
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument("--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview")
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
-    parser.add_argument(
-        "--precision",
-        default="bf16",
-        type=str,
-        choices=["fp32", "bf16", "fp16"],
-        help="precision for inference",
-    )
+    parser.add_argument("--precision", default="bf16", type=str,choices=["fp32", "bf16", "fp16"],help="precision for inference",)
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument("--lora_r", default=8, type=int)
-    parser.add_argument(
-        "--vision-tower", default="openai/clip-vit-large-patch14", type=str
-    )
+    parser.add_argument("--vision-tower", default="openai/clip-vit-large-patch14", type=str)
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
-
-    parser.add_argument(
-        "--dataset", default="sem_seg||refer_seg||vqa||reason_seg", type=str
-    )
+    parser.add_argument("--dataset", default="sem_seg||refer_seg||vqa||reason_seg", type=str)
     parser.add_argument("--sample_rates", default="9,3,3,1", type=str)
-    parser.add_argument(
-        "--sem_seg_data",
-        default="ade20k||cocostuff||pascal_part||paco_lvis||mapillary",
-        type=str,
-    )
-    parser.add_argument(
-        "--refer_seg_data", default="refclef||refcoco||refcoco+||refcocog", type=str
-    )
+    parser.add_argument("--sem_seg_data", default="ade20k||cocostuff||pascal_part||paco_lvis||mapillary", type=str)
+    parser.add_argument("--refer_seg_data", default="refclef||refcoco||refcoco+||refcocog", type=str)
     parser.add_argument("--vqa_data", default="llava_instruct_150k", type=str)
     parser.add_argument("--reason_seg_data", default="ReasonSeg|train", type=str)
     parser.add_argument("--val_dataset", default="ReasonSeg|val", type=str)
@@ -71,14 +54,8 @@ def parse_args(args):
     parser.add_argument("--exp_name", default="pixellm", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=500, type=int)
-    parser.add_argument(
-        "--batch_size", default=2, type=int, help="batch size per device per step"
-    )
-    parser.add_argument(
-        "--grad_accumulation_steps",
-        default=10,
-        type=int,
-    )
+    parser.add_argument("--batch_size", default=2, type=int, help="batch size per device per step")
+    parser.add_argument("--grad_accumulation_steps",default=10,type=int,)
     parser.add_argument("--val_batch_size", default=1, type=int)
     parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--lr", default=0.0003, type=float)
@@ -117,18 +94,11 @@ def parse_args(args):
     parser.add_argument("--separate_mm_projector", action="store_true", default=False)
     parser.add_argument("--image_feature_scale_num", default=1, type=int)
     # newly added
-    parser.add_argument("--eva_clip_path", default="eva02_large_patch14_clip_336.merged2b", type=str)
-    parser.add_argument("--dino_path", default="vit_large_patch14_dinov2.lvd142m", type=str)
+    parser.add_argument("--eva_clip_path", default="timm/eva02_large_patch14_clip_336.merged2b_s6b_b61k", type=str)
+    parser.add_argument("--dino_path", default="timm/vit_large_patch14_reg4_dinov2.lvd142m", type=str)
     parser.add_argument("--qformer_path", default="Salesforce/blip2-qformer", type=str)
     parser.add_argument("--num_query", default=32, type=int)
-
-    
-    parser.add_argument(
-        "--conv_type",
-        default="llava_v1",
-        type=str,
-        choices=["llava_v1", "llava_llama_2"],
-    )
+    parser.add_argument("--conv_type",default="llava_llama_2",type=str,choices=["llava_v1", "llava_llama_2"],)
     return parser.parse_args(args)
 
 
@@ -594,6 +564,7 @@ def train(
     # switch to train mode
     model.train()
     end = time.time()
+    print("Start training...")
     for global_step in range(args.steps_per_epoch):
         for i in range(args.grad_accumulation_steps):
             try:
